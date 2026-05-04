@@ -1,14 +1,14 @@
 #!/bin/bash
 # Run all steps in sequence
 
-set -e  # Exit on error
+# set -e  # Exit on error
 
-echo "=== Starting Benchmark ==="
+# echo "=== Starting Benchmark ==="
 
 # Make scripts executable
 chmod +x scripts/*.sh
 
-# Run all steps in sequence
+# # Run all steps in sequence
 echo "Step 1: Downloading dataset..."
 ./scripts/download_dataset.sh
 

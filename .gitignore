@@ -18,3 +18,5 @@ results/
 
 analysis_results/
 *.png
+data/
+*claude/
