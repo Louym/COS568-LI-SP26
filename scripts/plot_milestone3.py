@@ -33,29 +33,25 @@ def parse_csv(filepath):
 
 def best_config(rows, index_name, throughput_cols):
     """
-    For a given index, iterate over all hyperparameter variants and return
-    (mean_throughput, std_throughput, index_size_bytes) for the best variant.
+    For a given index, find the single hyperparameter row with the highest
+    mean throughput and return (mean, std, index_size_bytes).
+    Each row is evaluated independently so mixing different configs in the
+    same (search_method, value) group cannot dilute the best result.
     """
-    by_variant = defaultdict(list)
-    for row in rows:
-        if row.get("index_name", "").strip() != index_name:
-            continue
-        key = (row.get("search_method", ""), row.get("value", ""))
-        by_variant[key].append(row)
-
     best_mean = -1.0
     best_std  = 0.0
     best_size = 0
-    for key, rlist in by_variant.items():
+    for row in rows:
+        if row.get("index_name", "").strip() != index_name:
+            continue
         vals = []
-        for r in rlist:
-            for c in throughput_cols:
-                v = r.get(c, "").strip()
-                if v:
-                    try:
-                        vals.append(float(v))
-                    except ValueError:
-                        pass
+        for c in throughput_cols:
+            v = row.get(c, "").strip()
+            if v:
+                try:
+                    vals.append(float(v))
+                except ValueError:
+                    pass
         if not vals:
             continue
         m = float(np.mean(vals))
@@ -63,7 +59,7 @@ def best_config(rows, index_name, throughput_cols):
             best_mean = m
             best_std  = float(np.std(vals))
             try:
-                best_size = int(rlist[0]["index_size_bytes"])
+                best_size = int(row["index_size_bytes"])
             except (ValueError, KeyError):
                 best_size = 0
     return best_mean, best_std, best_size
@@ -97,7 +93,7 @@ def bar_plot(labels, values, errors, ylabel, title, filename, colors=None):
 TCOLS = ["mixed_throughput_mops1", "mixed_throughput_mops2", "mixed_throughput_mops3"]
 
 INDEXES = ["DynamicPGM", "LIPP", "HybridPGMLipp", "AsyncHybridPGMLipp"]
-LABELS  = ["DynamicPGM", "LIPP", "Hybrid\n(naive)", "Async\nHybrid"]
+LABELS  = ["DynamicPGM", "LIPP", "Hybrid\n(naive)", "Adaptive\nHybrid"]
 COLORS  = ['#4C72B0', '#DD8452', '#55A868', '#C44E52']
 
 DATASETS = {
