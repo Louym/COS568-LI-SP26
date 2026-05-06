@@ -20,3 +20,15 @@ analysis_results/
 *.png
 data/
 *claude/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+
+# SLURM logs and core dumps
+logs/
+core.*
+
+# Generated plots (reproduced by plot script)
+plots/
