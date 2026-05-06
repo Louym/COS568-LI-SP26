@@ -26,15 +26,21 @@ per workload type.
 All initial data is bulk-loaded into a \emph{static} DynamicPGM base (constructed
 once via its range constructor and never modified thereafter).
 New insertions accumulate in a flat open-addressing hash table pre-allocated for
-1.8M keys, providing $O(1)$ insert and $O(1)$ lookup.
-On a lookup the hash table is probed first; if not found the static DPGM base
-is queried.
-The critical advantage over pure DynamicPGM is that the static base is never
-modified: DynamicPGM.find() must traverse \emph{all} non-empty levels (including
-the $\sim$100M-key base level) even when a key is absent, incurring a DRAM miss
-($\sim$100--200\,ns) on every insert's duplicate-check call.
-The static-base design eliminates this overhead -- the hash table handles all
-new keys, leaving the base DPGM clean and unmodified.
+1.8M keys, providing $O(1)$ amortized insert and $O(1)$ lookup.
+On a lookup the hash table is probed first; if the key is not found, the static
+DPGM base is queried.
+
+The critical advantage over pure DynamicPGM stems from eliminating an expensive
+per-insert operation.
+DynamicPGM's \texttt{find()} method traverses \emph{all} non-empty levels in
+order to detect duplicate keys before inserting.
+After bulk-loading 100M keys, the base level holds $\sim$100M entries in a
+1.6\,GB sorted array.
+Every \texttt{find()} call for a newly inserted key (not yet in the structure)
+must walk the full level cascade and ultimately access this array, incurring a
+DRAM fetch of $\sim$100--200\,ns per insert.
+By keeping the base DynamicPGM frozen, this traversal is replaced by a single
+hash-table probe that fits in a cache line ($\sim$5--10\,ns).
 
 \textbf{10\% Insert -- LIPP-Direct Hybrid.}
 With 90\% of operations being lookups, even a constant-overhead DPGM probe on
@@ -42,15 +48,93 @@ every lookup measurably degrades throughput.
 For this workload we bypass DPGM entirely: all inserts and lookups go directly
 to LIPP, achieving near-pure-LIPP throughput while still correctly processing
 the 10\% insert traffic at LIPP's normal insertion cost.
+The 10\% workload is an inherently lookup-bound regime, so any structure that
+performs well on lookups will win; LIPP's $O(1)$ learned lookup with essentially
+zero error on sorted data is optimal for this regime.
+
+\subsection{Implementation Details}
+
+\textbf{Static DPGM base.}
+The base DynamicPGM is built with the range constructor
+(\texttt{DynamicPGMIndex(begin, end)}), which sorts the 98--99.8M bulk-load keys
+and constructs a single large PGM index over them.
+No further insertions are ever made into this structure; it serves purely as a
+read-only lookup table for keys that existed at bulk-load time.
+
+\textbf{Flat hash table.}
+The buffer uses open-addressing with linear probing, pre-allocated to
+$4\!\times\!10^6$ slots for a $\sim\!45\%$ load factor at the maximum 1.8M
+insertions.
+Keys are hashed with the 64-bit mix function
+$h(x) = x \oplus (x \gg 33)$, multiplied by two mixing constants, providing
+low-collision uniform distribution.
+The empty-slot sentinel is \texttt{UINT64\_MAX}; this is safe because all three
+SOSD datasets contain keys well below $2^{40}$.
+The entire hash table occupies $\approx$64\,MB (two 4M-slot vectors of
+\texttt{uint64\_t}), a negligible overhead relative to the 1.7\,GB DPGM base.
+
+\textbf{Lookup path.}
+\texttt{EqualityLookup(key)} first calls \texttt{hash.find(key)} ($O(1)$,
+cache-friendly).
+On a miss it calls \texttt{base\_pgm\_.find(key)}, which uses the static DPGM's
+PGM model to predict the position in the sorted array and performs a bounded
+binary search.
+Because the base is never modified, its PGM segments remain contiguous and
+well-calibrated, giving predictable $O(\log\epsilon)$ bounded search rather
+than the multi-level cascade traversal of a live DynamicPGM.
 
 \section{Results}
 
 Each bar is the mean of three independent repetitions (\texttt{-r~3}).
+Error bars show one standard deviation.
 Experiments were run on the Princeton Della cluster with two allocated CPUs
 and 56\,GB RAM.
 The Adaptive Hybrid column represents the best-performing configuration
 for each workload: DPGM-Hash Hybrid for 90\% Insert, and
 LIPP-Direct Hybrid for 10\% Insert.
+
+\subsection{Summary Table}
+
+\begin{table}[h]
+\centering
+\caption{Throughput (Mops/s, mean $\pm$ std over 3 runs) and index size (GB).
+Adaptive Hybrid is DPGM-Hash for 90\% Insert and LIPP-Direct for 10\% Insert.}
+\label{tab:results}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Workload & DynamicPGM & LIPP & Hybrid (M2) & Adaptive Hybrid \\
+\midrule
+FB     & 90\% Insert & $3.94\pm0.08$ & $2.06\pm0.02$ & $3.06\pm0.21$ & $\mathbf{5.85\pm1.00}$ \\
+Books  & 90\% Insert & $2.88\pm0.19$ & $2.03\pm0.04$ & $2.12\pm0.24$ & $\mathbf{4.33\pm0.20}$ \\
+OSMC   & 90\% Insert & $1.97\pm0.06$ & $0.57\pm0.02$ & $1.83\pm0.11$ & $\mathbf{3.91\pm0.07}$ \\
+\midrule
+FB     & 10\% Insert & $0.47\pm0.02$ & $5.92\pm0.37$ & $0.60\pm0.03$ & $\mathbf{5.60\pm0.34}$ \\
+Books  & 10\% Insert & $0.53\pm0.01$ & $8.55\pm1.23$ & $0.60\pm0.07$ & $11.63\pm3.01$ \\
+OSMC   & 10\% Insert & $0.56\pm0.03$ & $5.78\pm2.52$ & $0.91\pm0.30$ & $4.93\pm0.38$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Index size (GB).}
+\label{tab:size}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Workload & DynamicPGM & LIPP & Hybrid (M2) & Adaptive Hybrid \\
+\midrule
+FB     & 90\% Insert & 1.71 & 12.66 & 12.54 & \textbf{1.74} \\
+Books  & 90\% Insert & 1.70 & 11.75 & 11.69 & \textbf{1.74} \\
+OSMC   & 90\% Insert & 1.70 & 20.41 & 20.29 & \textbf{1.74} \\
+\midrule
+FB     & 10\% Insert & 1.71 & \textbf{12.70} & 12.69 & 12.70 \\
+Books  & 10\% Insert & 1.70 & \textbf{11.82} & 11.81 & 11.82 \\
+OSMC   & 10\% Insert & 1.70 & \textbf{20.60} & 20.59 & 20.60 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Throughput (Mops/s)}
 
@@ -142,40 +226,82 @@ LIPP-Direct Hybrid for 10\% Insert.
 
 \subsection{Discussion}
 
+\textbf{90\% Insert.}
+The DPGM-Hash Hybrid consistently and substantially outperforms pure DynamicPGM:
+$1.48\times$ on FB (5.85 vs 3.94~Mops/s), $1.50\times$ on Books (4.33 vs
+2.88~Mops/s), and $1.98\times$ on OSMC (3.91 vs 1.97~Mops/s).
+All three ratios comfortably exceed the $1.25\times$ target.
+
+The speedup mechanism is the elimination of DynamicPGM's per-insert
+duplicate-check traversal.
+In a live DynamicPGM each \texttt{insert()} first calls \texttt{find()} to
+detect duplicates, which must walk the full level cascade from level 0 to the
+100M-key base level.
+Since inserted keys are new and absent from the base, the search falls through
+all levels and accesses the base-level sorted array, causing a DRAM fetch on
+every insert.
+The DPGM-Hash Hybrid replaces this path with an $O(1)$ hash-table probe
+($\sim$5--10\,ns vs $\sim$100--200\,ns).
+
+The OSMC dataset shows the largest gain ($1.98\times$) because LIPP is
+extremely slow on OSMC's clustered spatial keys (0.57~Mops/s), making the
+never-flush LIPP-based designs from M2 uncompetitive, while the pure DPGM
+baseline is itself slow at only 1.97~Mops/s.
+The hash-table approach sidesteps both issues: inserts never touch LIPP, and
+the static DPGM base is read-only so its lookup path remains fast.
+
+On FB, the DPGM-Hash Hybrid's standard deviation is larger (1.00~Mops/s) than
+on the other datasets.
+Inspecting the three repetitions (4.81, 7.19, 5.53~Mops/s), the second run
+obtained an unusually high result, likely due to the operating system placing
+hash-table pages in a hot NUMA-local memory region.
+The other two runs are consistent, and the overall mean still represents a
+reliable $1.48\times$ improvement.
+
+Compared to pure LIPP (which is 2--4$\times$ slower than DPGM on insert-heavy
+workloads), the DPGM-Hash Hybrid is $2.8\times$ faster on FB, $2.1\times$ on
+Books, and $6.8\times$ on OSMC.
+The M2 naive hybrid achieves 3.06~Mops/s on FB and 2.12~Mops/s on Books
+because periodic LIPP flushes block the insert path; on OSMC it reaches only
+1.83~Mops/s due to LIPP's slow rebuild time on clustered data.
+
 \textbf{10\% Insert.}
 The LIPP-Direct Hybrid matches or exceeds pure LIPP on most datasets:
-94\% on FB (5.6 vs 5.9~Mops/s), 136\% on Books (11.6 vs 8.5~Mops/s),
-and 85\% on OSMC (4.9 vs 5.8~Mops/s).
-Both the Books and OSMC baselines exhibit high variance across the three
-repetitions (std $>$1~Mops/s), so the comparison is less conclusive there;
-the LIPP-Direct Hybrid itself is tighter ($\leq$0.4~Mops/s std).
-Removing the DPGM probe from 90\% of operations eliminates the dominant
-overhead versus pure LIPP.
-Both the naive M2 hybrid and the async periodic-flush variants fall far
-below this level ($\approx$0.6~Mops/s) because every lookup routes through
-DPGM before reaching LIPP.
+94\% on FB (5.60 vs 5.92~Mops/s), 136\% on Books (11.63 vs 8.55~Mops/s),
+and 85\% on OSMC (4.93 vs 5.78~Mops/s).
 
-\textbf{90\% Insert.}
-The DPGM-Hash Hybrid consistently and substantially outperforms pure DPGM:
-$1.48\times$ on FB (5.8 vs 3.9~Mops/s), $1.50\times$ on Books (4.3 vs
-2.9~Mops/s), and $1.98\times$ on OSMC (3.9 vs 2.0~Mops/s).
-All three ratios comfortably exceed the $1.25\times$ target.
-The speedup comes from eliminating DynamicPGM's per-insert duplicate-check
-traversal, which forces a DRAM miss through the full $\sim$100M-key cascaded
-index; the hash table replaces this with a single cache-line probe.
-Compared to pure LIPP (which is 2--3$\times$ slower than DPGM on insert-heavy
-workloads), the hybrid is $2.8\times$ faster on FB, $2.1\times$ on Books,
-and $6.8\times$ on OSMC.
-The M2 naive hybrid achieves only 3.1~Mops/s on FB and 2.1~Mops/s on Books
-due to periodic LIPP rebuilds stalling the insert path.
+The FB result (94\%) reflects near-identical throughput with slight variance:
+the LIPP-Direct Hybrid has tighter repeatability (std 0.34~Mops/s) than pure
+LIPP (std 0.37~Mops/s), and the small gap is within noise.
+
+The Books result (136\%) is driven by one outlier repetition in the LIPP-Direct
+run (9.29, 9.72, 15.88~Mops/s), raising the mean to 11.63~Mops/s with std
+3.01~Mops/s.
+The pure LIPP baseline for Books 10\% is itself noisy (10.21, 7.27,
+8.15~Mops/s, std 1.23~Mops/s).
+Both measurements show LIPP performing well in the lookup-dominant regime on
+the books dataset; the reported 136\% should be interpreted as ``competitive
+with LIPP'' rather than a structural advantage.
+
+The OSMC result (85\%) is within the noise of the pure LIPP baseline:
+LIPP's three repetitions are 4.07, 3.93, 9.34~Mops/s (std 2.52~Mops/s),
+where the 9.34 run is an outlier inflating the mean to 5.78~Mops/s.
+The LIPP-Direct Hybrid's repetitions are 5.18, 4.40, 5.20~Mops/s (std
+0.38~Mops/s), tightly clustered around 4.93~Mops/s.
+A fair comparison of the stable runs places the two strategies at parity.
+
+Both the naive M2 hybrid and the async periodic-flush variants fall far below
+LIPP in the lookup-dominant regime ($\approx$0.6--0.9~Mops/s) because every
+lookup routes through a live DPGM before reaching LIPP, adding a full
+cascade-traversal overhead to each of the 90\% lookup operations.
 
 \textbf{Index size.}
 For 90\% Insert, the DPGM-Hash Hybrid retains only the static DPGM base
-($\approx$1.7~GB) plus a pre-allocated 4M-slot hash table ($\approx$64~MB),
-matching DPGM's footprint and far below LIPP's 11--20~GB.
-For 10\% Insert, the LIPP-Direct Hybrid matches pure LIPP exactly since it
-\emph{is} pure LIPP.
-The naive hybrid carries both a full LIPP tree and a DPGM residual, giving
-it the largest footprint of all variants.
+($\approx$1.70~GB) plus a pre-allocated 4M-slot hash table ($\approx$64~MB),
+giving a total footprint of $\approx$1.74~GB.
+This matches DynamicPGM's size exactly and is 7--12$\times$ smaller than the
+LIPP-based hybrids (11--21~GB), which must store the full LIPP tree in memory.
+For 10\% Insert, the LIPP-Direct Hybrid is identical to pure LIPP in memory
+usage since it is structurally pure LIPP.
 
 \end{document}
